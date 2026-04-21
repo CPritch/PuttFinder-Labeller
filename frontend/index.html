@@ -7,10 +7,14 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">PuttFinder Labeller <span class="phase">MVP</span></div>
+    <div class="brand">PuttFinder Labeller <span class="phase">v1.0</span></div>
     <div class="load-row">
       <input id="videoPath" type="text" placeholder="Absolute path to .avi (e.g. /home/user/PuttFinder-Labeller/videos/clip.avi)" />
       <button id="loadBtn">Load Video</button>
+      <label class="preset-wrap">
+        Rig
+        <select id="presetSelect"></select>
+      </label>
     </div>
     <div class="save-row">
       <button id="undoBtn" title="Undo (Ctrl+Z)">Undo</button>
@@ -80,7 +84,12 @@
 
       <hr />
 
-      <h2>Video</h2>
+      <h2>Segments (active ball)</h2>
+      <ul id="segmentList"></ul>
+
+      <hr />
+
+      <h2>Video / Rig</h2>
       <div id="metaReadout" class="muted small">No video loaded.</div>
     </aside>
   </main>

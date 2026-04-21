@@ -26,7 +26,11 @@ const els = {
   ballList: document.getElementById("ballList"),
   metaReadout: document.getElementById("metaReadout"),
   newBallBtn: document.getElementById("newBallBtn"),
+  presetSelect: document.getElementById("presetSelect"),
+  segmentList: document.getElementById("segmentList"),
 };
+
+const GOLF_BALL_RADIUS_M = 0.021335;
 
 const BALL_COLORS = [
   "#4da3ff", "#ff7043", "#66d9a8", "#ffd166",
@@ -48,7 +52,14 @@ const state = {
   magEnabled: true,
   dragging: null,
   history: { undo: [], redo: [] },
+  presets: [],
+  preset: null,
+  segmentModes: new Map(), // key "ballId:startFrame" -> "linear" | "const_accel"
+  trajectoryCache: new Map(), // ballId -> { map: Map<frame, row>, sig: string }
 };
+
+function segKey(ballId, startFrame) { return `${ballId}:${startFrame}`; }
+function invalidateTrajectories() { state.trajectoryCache.clear(); }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -78,7 +89,12 @@ function serialize() {
     }
     out.push([id, { id, keyframes: kfs }]);
   }
-  return { balls: out, nextBallId: state.nextBallId, activeBallId: state.activeBallId };
+  return {
+    balls: out,
+    nextBallId: state.nextBallId,
+    activeBallId: state.activeBallId,
+    segmentModes: [...state.segmentModes.entries()],
+  };
 }
 
 function restore(snap) {
@@ -92,6 +108,8 @@ function restore(snap) {
   }
   state.nextBallId = snap.nextBallId;
   state.activeBallId = snap.activeBallId;
+  state.segmentModes = new Map(snap.segmentModes || []);
+  invalidateTrajectories();
   if (state.selection) {
     const ball = state.balls.get(state.selection.ballId);
     if (!ball || !ball.keyframes.has(state.selection.frame)) state.selection = null;
@@ -148,10 +166,105 @@ function deleteBall(id) {
   if (!state.balls.has(id)) return;
   pushHistory();
   state.balls.delete(id);
+  deleteBallCascade(id);
   if (state.activeBallId === id) state.activeBallId = null;
   if (state.selection && state.selection.ballId === id) state.selection = null;
+  invalidateTrajectories();
   renderAll();
   autoSave();
+}
+
+// ------------------------------------------------------------ camera math
+function hasCamera() {
+  return !!(state.preset && state.preset.camera && state.preset.camera.matrix_world);
+}
+
+function fPx() {
+  if (!hasCamera() || !state.meta) return null;
+  const cam = state.preset.camera;
+  const W = state.meta.width || (state.preset.resolution && state.preset.resolution[0]);
+  if (!W) return null;
+  return cam.focal_length_mm * W / cam.sensor_width_mm;
+}
+
+function matCol(m, i) { return [m[0][i], m[1][i], m[2][i]]; }
+function matTrans(m) { return [m[0][3], m[1][3], m[2][3]]; }
+function v3Add(a, b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
+function v3Sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+function v3Mul(a, s) { return [a[0]*s, a[1]*s, a[2]*s]; }
+function v3Dot(a, b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+function v3Norm(a) { return Math.hypot(a[0], a[1], a[2]); }
+
+// Camera-space ray for a pixel (x, y). Blender convention: image +x right,
+// +y up; camera looks along -Z. (px, py) are in OpenCV-style top-left origin
+// image coords, so py is flipped.
+function pixelToCamRay(px, py) {
+  const f = fPx();
+  if (f == null || !state.meta) return null;
+  const cx = state.meta.width / 2;
+  const cy = state.meta.height / 2;
+  return [(px - cx) / f, -(py - cy) / f, -1];
+}
+
+// Convert a pixel center + pixel radius into a world-space ball position
+// plus depth (scalar projection along the camera forward axis).
+function pixelToWorld(px, py, pixel_radius) {
+  if (!hasCamera() || !state.meta) return null;
+  const f = fPx();
+  if (!f || !pixel_radius || pixel_radius <= 0) return null;
+  const ray = pixelToCamRay(px, py);
+  const rayLen = v3Norm(ray);
+  // Euclidean distance from camera to ball center (small-ball approximation).
+  const L = GOLF_BALL_RADIUS_M * f / pixel_radius;
+  const cam = state.preset.camera;
+  const R = cam.matrix_world; // column-major camera basis in world
+  const xCam = matCol(R, 0), yCam = matCol(R, 1), zCam = matCol(R, 2);
+  const camPos = matTrans(R);
+  // World direction from camera through the pixel.
+  const dirWorld = v3Add(v3Add(v3Mul(xCam, ray[0]), v3Mul(yCam, ray[1])), v3Mul(zCam, ray[2]));
+  const dirLen = v3Norm(dirWorld);
+  const ballWorld = v3Add(camPos, v3Mul(dirWorld, L / dirLen));
+  // Depth along camera forward = -zCam (since camera looks along -Z).
+  const forward = v3Mul(zCam, -1);
+  const depth = v3Dot(v3Sub(ballWorld, camPos), forward);
+  return { world_pos: ballWorld, depth, ray_len: rayLen };
+}
+
+function surfacePlane() {
+  if (!state.preset || !state.preset.surface) return null;
+  const s = state.preset.surface;
+  return { point: s.point, normal: s.normal, threshold: s.proximity_threshold_m ?? 0.05 };
+}
+
+function pointToPlaneDistance(worldPos) {
+  const plane = surfacePlane();
+  if (!plane) return null;
+  const n = plane.normal;
+  const nlen = v3Norm(n);
+  if (nlen === 0) return null;
+  const d = v3Dot(v3Sub(worldPos, plane.point), n) / nlen;
+  return d;
+}
+
+// Infer segment mode from two bounding keyframes. On-surface (both within
+// threshold) → const_accel; otherwise linear.
+function inferSegmentMode(k1, k2) {
+  if (!hasCamera()) return "linear";
+  const p1 = pixelToWorld(k1.pixel_pos[0], k1.pixel_pos[1], k1.radius);
+  const p2 = pixelToWorld(k2.pixel_pos[0], k2.pixel_pos[1], k2.radius);
+  if (!p1 || !p2) return "linear";
+  const d1 = pointToPlaneDistance(p1.world_pos);
+  const d2 = pointToPlaneDistance(p2.world_pos);
+  const plane = surfacePlane();
+  if (d1 == null || d2 == null || !plane) return "linear";
+  const thr = plane.threshold;
+  return (Math.abs(d1) <= thr && Math.abs(d2) <= thr) ? "const_accel" : "linear";
+}
+
+function resolveSegmentMode(ballId, startFrame, k1, k2) {
+  const override = state.segmentModes.get(segKey(ballId, startFrame));
+  if (override === "linear" || override === "const_accel") return { mode: override, source: "manual" };
+  return { mode: inferSegmentMode(k1, k2), source: "auto" };
 }
 
 function sortedKeyframes(ball) {
@@ -160,48 +273,177 @@ function sortedKeyframes(ball) {
     .sort((a, b) => a.frame - b.frame);
 }
 
-function markerAt(ball, frame) {
+function segmentsOf(ball) {
   const kfs = sortedKeyframes(ball);
-  if (kfs.length === 0) return null;
-  if (frame < kfs[0].frame || frame > kfs[kfs.length - 1].frame) return null;
-  for (let i = 0; i < kfs.length; i++) {
-    if (kfs[i].frame === frame) {
-      const radius = kfs[i].radius;
-      const pos = [...kfs[i].pixel_pos];
-      let vel = null;
-      if (i + 1 < kfs.length) {
-        const k2 = kfs[i + 1];
-        vel = segmentVel(kfs[i], k2);
-      } else if (i - 1 >= 0) {
-        const k0 = kfs[i - 1];
-        vel = segmentVel(k0, kfs[i]);
-      }
-      return { kind: "keyframe", pixel_pos: pos, pixel_vel: vel, radius };
-    }
-    if (kfs[i].frame > frame) {
-      const k1 = kfs[i - 1];
-      const k2 = kfs[i];
-      const t = (frame - k1.frame) / (k2.frame - k1.frame);
-      const pos = [
-        k1.pixel_pos[0] + t * (k2.pixel_pos[0] - k1.pixel_pos[0]),
-        k1.pixel_pos[1] + t * (k2.pixel_pos[1] - k1.pixel_pos[1]),
-      ];
-      const radius = k1.radius + t * (k2.radius - k1.radius);
-      return { kind: "interp", pixel_pos: pos, pixel_vel: segmentVel(k1, k2), radius };
-    }
+  const segs = [];
+  for (let i = 0; i + 1 < kfs.length; i++) {
+    segs.push({ k1: kfs[i], k2: kfs[i + 1], index: i });
   }
-  return null;
+  return { kfs, segs };
 }
 
-function segmentVel(k1, k2) {
-  const fps = state.meta && state.meta.fps > 0 ? state.meta.fps : 0;
-  if (!fps) return null;
+// Linear endpoint velocities (px/frame) for a segment.
+function linearEndVelPxPerFrame(k1, k2) {
   const df = k2.frame - k1.frame;
-  if (df === 0) return null;
-  return [
-    (k2.pixel_pos[0] - k1.pixel_pos[0]) * fps / df,
-    (k2.pixel_pos[1] - k1.pixel_pos[1]) * fps / df,
-  ];
+  if (df <= 0) return [0, 0];
+  return [(k2.pixel_pos[0] - k1.pixel_pos[0]) / df, (k2.pixel_pos[1] - k1.pixel_pos[1]) / df];
+}
+
+// Compute per-frame trajectory rows for a ball across [kfs[0].frame, kfs[-1].frame].
+// Returns an array of rows:
+//   { frame, pixel_pos:[x,y], pixel_vel:[vx,vy]|null (px/s),
+//     radius, isKeyframe:bool, segIndex:int, mode:"linear"|"const_accel" }
+// Const-accel segments inherit v_start from the previous segment's end velocity
+// (finite difference) and choose acceleration to land on p₂ at t=T:
+//   a = 2·(p₂ − p₁ − v_start·T) / T²   (T in frames)
+// Isolated two-keyframe segments have no prior → fall back to linear.
+function computeTrajectory(ball) {
+  const cached = state.trajectoryCache.get(ball.id);
+  const sig = trajectorySignature(ball);
+  if (cached && cached.sig === sig) return cached.rows;
+  const { kfs, segs } = segmentsOf(ball);
+  const rows = [];
+  if (kfs.length === 0) {
+    state.trajectoryCache.set(ball.id, { sig, rows });
+    return rows;
+  }
+  if (kfs.length === 1) {
+    const k = kfs[0];
+    rows.push({
+      frame: k.frame, pixel_pos: [...k.pixel_pos], pixel_vel: null,
+      radius: k.radius, isKeyframe: true, segIndex: -1, mode: "linear",
+    });
+    state.trajectoryCache.set(ball.id, { sig, rows });
+    return rows;
+  }
+
+  // First pass: resolve each segment's mode and remember per-segment v_start
+  // (px/frame) for const_accel, computed from prior segment's end velocity.
+  const segMeta = segs.map(({ k1, k2, index }) => {
+    const res = resolveSegmentMode(ball.id, k1.frame, k1, k2);
+    return { k1, k2, index, mode: res.mode, source: res.source, vStart: null, accel: null };
+  });
+  for (let i = 0; i < segMeta.length; i++) {
+    const s = segMeta[i];
+    const T = s.k2.frame - s.k1.frame;
+    if (s.mode === "const_accel" && T > 0) {
+      // v_start from previous segment's end velocity (per frame). For the
+      // first segment, there is no prior → fall back to linear.
+      if (i === 0) {
+        s.mode = "linear";
+        s.source = s.source === "manual" ? "manual_fallback" : "auto_fallback";
+      } else {
+        const prev = segMeta[i - 1];
+        const vPrevEnd = endVelocityPxPerFrame(prev);
+        const dp = [s.k2.pixel_pos[0] - s.k1.pixel_pos[0], s.k2.pixel_pos[1] - s.k1.pixel_pos[1]];
+        const a = [2 * (dp[0] - vPrevEnd[0] * T) / (T * T), 2 * (dp[1] - vPrevEnd[1] * T) / (T * T)];
+        s.vStart = vPrevEnd;
+        s.accel = a;
+      }
+    }
+  }
+
+  function endVelocityPxPerFrame(s) {
+    const T = s.k2.frame - s.k1.frame;
+    if (T <= 0) return [0, 0];
+    if (s.mode === "const_accel" && s.vStart && s.accel) {
+      return [s.vStart[0] + s.accel[0] * T, s.vStart[1] + s.accel[1] * T];
+    }
+    return linearEndVelPxPerFrame(s.k1, s.k2);
+  }
+
+  const fps = state.meta && state.meta.fps > 0 ? state.meta.fps : null;
+  const pushRow = (frame, pos, velPerFrame, radius, isKeyframe, segIndex, mode) => {
+    const vel = velPerFrame && fps
+      ? [velPerFrame[0] * fps, velPerFrame[1] * fps]
+      : null;
+    rows.push({ frame, pixel_pos: [...pos], pixel_vel: vel, radius, isKeyframe, segIndex, mode });
+  };
+
+  // Sample each segment [k1.frame, k2.frame]; include k1 exactly once across
+  // segments by emitting it only on the first segment and letting each
+  // subsequent segment start at k1.frame + 1.
+  for (let i = 0; i < segMeta.length; i++) {
+    const s = segMeta[i];
+    const { k1, k2 } = s;
+    const T = k2.frame - k1.frame;
+    const startF = i === 0 ? k1.frame : k1.frame + 1;
+    for (let f = startF; f <= k2.frame; f++) {
+      const tau = f - k1.frame;
+      let pos, velPF, radius, isKf, mode;
+      if (f === k1.frame) {
+        pos = [...k1.pixel_pos];
+        radius = k1.radius;
+        isKf = true;
+        mode = s.mode;
+        velPF = i > 0 ? endVelocityPxPerFrame(segMeta[i - 1]) : (s.mode === "linear" ? linearEndVelPxPerFrame(k1, k2) : (s.vStart || [0, 0]));
+      } else if (f === k2.frame) {
+        pos = [...k2.pixel_pos];
+        radius = k2.radius;
+        isKf = true;
+        mode = s.mode;
+        velPF = endVelocityPxPerFrame(s);
+      } else {
+        const u = tau / T;
+        if (s.mode === "const_accel") {
+          const p = [
+            k1.pixel_pos[0] + s.vStart[0] * tau + 0.5 * s.accel[0] * tau * tau,
+            k1.pixel_pos[1] + s.vStart[1] * tau + 0.5 * s.accel[1] * tau * tau,
+          ];
+          pos = p;
+          velPF = [s.vStart[0] + s.accel[0] * tau, s.vStart[1] + s.accel[1] * tau];
+        } else {
+          pos = [
+            k1.pixel_pos[0] + u * (k2.pixel_pos[0] - k1.pixel_pos[0]),
+            k1.pixel_pos[1] + u * (k2.pixel_pos[1] - k1.pixel_pos[1]),
+          ];
+          velPF = linearEndVelPxPerFrame(k1, k2);
+        }
+        radius = k1.radius + u * (k2.radius - k1.radius);
+        isKf = false;
+        mode = s.mode;
+      }
+      pushRow(f, pos, velPF, radius, isKf, s.index, mode);
+    }
+  }
+
+  state.trajectoryCache.set(ball.id, { sig, rows });
+  return rows;
+}
+
+function trajectorySignature(ball) {
+  const kfs = sortedKeyframes(ball);
+  const parts = kfs.map((k) => `${k.frame},${k.pixel_pos[0].toFixed(3)},${k.pixel_pos[1].toFixed(3)},${k.radius.toFixed(3)}`);
+  const overrides = [];
+  if (kfs.length > 0) {
+    for (let i = 0; i + 1 < kfs.length; i++) {
+      const m = state.segmentModes.get(segKey(ball.id, kfs[i].frame));
+      if (m) overrides.push(`${kfs[i].frame}:${m}`);
+    }
+  }
+  const preset = state.preset ? state.preset.id : "none";
+  return `${preset}|${parts.join("|")}||${overrides.join(",")}`;
+}
+
+function rowAt(ball, frame) {
+  const rows = computeTrajectory(ball);
+  if (rows.length === 0) return null;
+  if (frame < rows[0].frame || frame > rows[rows.length - 1].frame) return null;
+  // Rows are dense and contiguous; direct offset lookup.
+  const idx = frame - rows[0].frame;
+  return rows[idx] || null;
+}
+
+function markerAt(ball, frame) {
+  const r = rowAt(ball, frame);
+  if (!r) return null;
+  return {
+    kind: r.isKeyframe ? "keyframe" : "interp",
+    pixel_pos: r.pixel_pos,
+    pixel_vel: r.pixel_vel,
+    radius: r.radius,
+    mode: r.mode,
+  };
 }
 
 function addOrUpdateKeyframe(ballId, frame, pos, radius) {
@@ -218,12 +460,15 @@ function addOrUpdateKeyframe(ballId, frame, pos, radius) {
   });
   state.selection = { ballId, frame };
   state.activeBallId = ballId;
+  invalidateTrajectories();
 }
 
 function deleteKeyframe(ballId, frame) {
   const ball = state.balls.get(ballId);
   if (!ball || !ball.keyframes.has(frame)) return;
   pushHistory();
+  // Drop any segment overrides that referenced this frame as a start key.
+  state.segmentModes.delete(segKey(ballId, frame));
   ball.keyframes.delete(frame);
   if (ball.keyframes.size === 0) {
     state.balls.delete(ballId);
@@ -232,8 +477,15 @@ function deleteKeyframe(ballId, frame) {
   if (state.selection && state.selection.ballId === ballId && state.selection.frame === frame) {
     state.selection = null;
   }
+  invalidateTrajectories();
   renderAll();
   autoSave();
+}
+
+function deleteBallCascade(id) {
+  for (const key of [...state.segmentModes.keys()]) {
+    if (key.startsWith(`${id}:`)) state.segmentModes.delete(key);
+  }
 }
 
 function drawOverlay() {
@@ -332,9 +584,11 @@ function renderMarkerList() {
     const isSel = state.selection && state.selection.ballId === ball.id
       && state.selection.frame === state.currentFrame && m.kind === "keyframe";
     if (isSel) li.classList.add("selected");
+    const modeCls = m.mode === "const_accel" ? "accel" : "linear";
+    const modeTag = m.mode ? `<span class="kind-tag ${modeCls}">${m.mode}</span>` : "";
     const tag = m.kind === "keyframe"
-      ? `<span class="kind-tag key">KEY</span>`
-      : `<span class="kind-tag interp">interp</span>`;
+      ? `<span class="kind-tag key">KEY</span>${modeTag}`
+      : `<span class="kind-tag interp">interp</span>${modeTag}`;
     const del = m.kind === "keyframe"
       ? `<button class="del" title="Delete keyframe">✕</button>`
       : "";
@@ -371,10 +625,63 @@ function renderFrameReadout() {
   els.timeReadout.textContent = `${t.toFixed(3)} s`;
 }
 
+function renderSegmentList() {
+  els.segmentList.innerHTML = "";
+  const id = state.activeBallId;
+  const ball = id != null ? state.balls.get(id) : null;
+  if (!ball) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = "— no active ball —";
+    els.segmentList.appendChild(li);
+    return;
+  }
+  const { segs } = segmentsOf(ball);
+  if (segs.length === 0) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = "— need two keyframes —";
+    els.segmentList.appendChild(li);
+    return;
+  }
+  for (const { k1, k2, index } of segs) {
+    const override = state.segmentModes.get(segKey(ball.id, k1.frame)) || "auto";
+    const inferred = inferSegmentMode(k1, k2);
+    const effective = override === "auto" ? inferred : override;
+    const li = document.createElement("li");
+    li.className = "segment";
+    const tagCls = effective === "const_accel" ? "accel" : "linear";
+    li.innerHTML = `
+      <span>seg ${index + 1}</span>
+      <span class="muted">${k1.frame}→${k2.frame}</span>
+      <span class="kind-tag ${tagCls}">${effective}</span>
+      <span class="segment-mode">
+        <select title="Override mode">
+          <option value="auto">auto (${inferred})</option>
+          <option value="linear">linear</option>
+          <option value="const_accel">const_accel</option>
+        </select>
+      </span>
+    `;
+    const sel = li.querySelector("select");
+    sel.value = override;
+    sel.addEventListener("change", () => {
+      pushHistory();
+      if (sel.value === "auto") state.segmentModes.delete(segKey(ball.id, k1.frame));
+      else state.segmentModes.set(segKey(ball.id, k1.frame), sel.value);
+      invalidateTrajectories();
+      renderAll();
+      autoSave();
+    });
+    els.segmentList.appendChild(li);
+  }
+}
+
 function renderAll() {
   drawOverlay();
   renderBallList();
   renderMarkerList();
+  renderSegmentList();
   renderFrameReadout();
   updateUndoRedoButtons();
 }
@@ -445,80 +752,164 @@ function findMarkerAtPoint(x, y) {
   return hits[0] || null;
 }
 
+function roundVec(v, n = 6) {
+  return v == null ? null : v.map((x) => Number(x.toFixed(n)));
+}
+
+function worldVelAt(ball, f, rows, idx) {
+  if (idx <= 0) return null;
+  const fps = state.meta && state.meta.fps > 0 ? state.meta.fps : null;
+  if (!fps) return null;
+  const prev = rows[idx - 1];
+  const curr = rows[idx];
+  if (!prev.world_pos || !curr.world_pos) return null;
+  const dt = 1 / fps;
+  return [
+    (curr.world_pos[0] - prev.world_pos[0]) / dt,
+    (curr.world_pos[1] - prev.world_pos[1]) / dt,
+    (curr.world_pos[2] - prev.world_pos[2]) / dt,
+  ];
+}
+
 function buildPayload() {
   const balls = [...state.balls.values()];
   const frameMin = state.meta ? state.meta.frame_start : 1;
   const frameMax = state.meta ? state.meta.frame_end : 1;
+
+  // Precompute per-ball dense rows + world projections (depth/world_pos) to
+  // allow backward-difference world_vel.
+  const perBall = new Map();
+  for (const ball of balls) {
+    const rows = computeTrajectory(ball);
+    const enriched = rows.map((r) => {
+      const w = pixelToWorld(r.pixel_pos[0], r.pixel_pos[1], r.radius);
+      return {
+        frame: r.frame,
+        pixel_pos: r.pixel_pos,
+        pixel_vel: r.pixel_vel,
+        radius: r.radius,
+        isKeyframe: r.isKeyframe,
+        world_pos: w ? w.world_pos : null,
+        depth: w ? w.depth : null,
+      };
+    });
+    const byFrame = new Map();
+    enriched.forEach((row, idx) => {
+      byFrame.set(row.frame, { row, idx });
+    });
+    perBall.set(ball.id, { rows: enriched, byFrame });
+  }
+
   const frames = [];
   for (let f = frameMin; f <= frameMax; f++) {
     const list = [];
     for (const ball of balls) {
-      const m = markerAt(ball, f);
-      if (!m) continue;
+      const bundle = perBall.get(ball.id);
+      const found = bundle && bundle.byFrame.get(f);
+      if (!found) continue;
+      const { row, idx } = found;
+      const worldVel = worldVelAt(ball, f, bundle.rows, idx);
       list.push({
         id: ball.id,
-        world_pos: null,
-        world_vel: null,
-        pixel_pos: m.pixel_pos,
-        pixel_vel: m.pixel_vel,
-        depth: null,
-        radius: m.radius,
+        world_pos: roundVec(row.world_pos),
+        world_vel: roundVec(worldVel),
+        pixel_pos: roundVec(row.pixel_pos, 3),
+        pixel_vel: roundVec(row.pixel_vel, 3),
+        depth: row.depth != null ? Number(row.depth.toFixed(6)) : null,
+        radius: Number(row.radius.toFixed(3)),
+        keyframe: row.isKeyframe === true ? true : false,
       });
     }
-    const hasAny = list.length > 0;
-    const allSpan = balls.some((b) => {
-      const kfs = sortedKeyframes(b);
-      return kfs.length && f >= kfs[0].frame && f <= kfs[kfs.length - 1].frame;
-    });
-    if (hasAny || allSpan) frames.push({
+    if (list.length === 0) continue;
+    frames.push({
       frame: f,
       time: state.meta && state.meta.fps > 0 ? (f - 1) / state.meta.fps : null,
       balls: list,
     });
   }
-  const header = state.meta ? {
-    fps: state.meta.fps,
-    resolution: state.meta.resolution,
-    frame_start: state.meta.frame_start,
-    frame_end: state.meta.frame_end,
-    camera: null,
-  } : { fps: null, resolution: null, frame_start: null, frame_end: null, camera: null };
+
+  const camera = state.preset && state.preset.camera ? state.preset.camera : null;
+  const surface = state.preset && state.preset.surface ? state.preset.surface : null;
+  const header = {
+    fps: state.meta ? state.meta.fps : null,
+    resolution: state.meta ? state.meta.resolution : null,
+    frame_start: state.meta ? state.meta.frame_start : null,
+    frame_end: state.meta ? state.meta.frame_end : null,
+    ball_radius_m: GOLF_BALL_RADIUS_M,
+    preset_id: state.preset ? state.preset.id : null,
+    camera,
+    surface,
+    segment_modes: [...state.segmentModes.entries()].map(([k, v]) => {
+      const [ballId, startFrame] = k.split(":");
+      return { ball_id: Number(ballId), start_frame: Number(startFrame), mode: v };
+    }),
+  };
   return { header, frames };
 }
 
 function ingestLoadedLabels(data) {
   state.balls.clear();
+  state.segmentModes.clear();
   state.nextBallId = 1;
   state.activeBallId = null;
   state.selection = null;
   state.history.undo.length = 0;
   state.history.redo.length = 0;
+  invalidateTrajectories();
   if (!data || !data.frames) return;
+
+  // Collect all frame/ball rows in order.
+  const rowsByBall = new Map();
   for (const fr of data.frames) {
     for (const b of fr.balls || []) {
       const id = b.id;
       if (!state.balls.has(id)) state.balls.set(id, { id, keyframes: new Map() });
       if (id >= state.nextBallId) state.nextBallId = id + 1;
+      if (!rowsByBall.has(id)) rowsByBall.set(id, []);
+      rowsByBall.get(id).push({
+        frame: fr.frame,
+        pixel_pos: b.pixel_pos,
+        radius: b.radius ?? state.defaultRadius,
+        keyframe: b.keyframe === true,
+      });
     }
   }
-  const kfFrames = new Map();
-  for (const fr of data.frames) {
-    for (const b of fr.balls || []) {
-      if (!kfFrames.has(b.id)) kfFrames.set(b.id, []);
-      kfFrames.get(b.id).push({ frame: fr.frame, pixel_pos: b.pixel_pos, radius: b.radius ?? state.defaultRadius });
-    }
-  }
-  for (const [id, rows] of kfFrames) {
+
+  for (const [id, rows] of rowsByBall) {
     rows.sort((a, b) => a.frame - b.frame);
     const ball = state.balls.get(id);
-    if (rows.length === 0) continue;
-    ball.keyframes.set(rows[0].frame, { pixel_pos: [...rows[0].pixel_pos], radius: rows[0].radius });
-    if (rows.length === 1) continue;
-    ball.keyframes.set(rows[rows.length - 1].frame, {
-      pixel_pos: [...rows[rows.length - 1].pixel_pos],
-      radius: rows[rows.length - 1].radius,
-    });
+    const explicit = rows.filter((r) => r.keyframe === true);
+    let chosen;
+    if (explicit.length >= 1) {
+      // Honor explicit keyframe flags. Always include the first and last
+      // appearance as keyframes too, so span reconstruction is lossless.
+      const firstRow = rows[0];
+      const lastRow = rows[rows.length - 1];
+      const set = new Map();
+      for (const r of explicit) set.set(r.frame, r);
+      set.set(firstRow.frame, firstRow);
+      set.set(lastRow.frame, lastRow);
+      chosen = [...set.values()].sort((a, b) => a.frame - b.frame);
+    } else {
+      // Legacy payload (no keyframe flags): fall back to endpoints only.
+      if (rows.length === 0) continue;
+      chosen = rows.length === 1 ? [rows[0]] : [rows[0], rows[rows.length - 1]];
+    }
+    for (const r of chosen) {
+      ball.keyframes.set(r.frame, { pixel_pos: [...r.pixel_pos], radius: r.radius });
+    }
   }
+
+  // Restore segment-mode overrides from header, if present.
+  const header = data.header || {};
+  for (const entry of header.segment_modes || []) {
+    if (!entry) continue;
+    const { ball_id, start_frame, mode } = entry;
+    if ((mode === "linear" || mode === "const_accel") && ball_id != null && start_frame != null) {
+      state.segmentModes.set(segKey(ball_id, start_frame), mode);
+    }
+  }
+
   if (state.balls.size > 0) state.activeBallId = Math.min(...state.balls.keys());
 }
 
@@ -580,11 +971,7 @@ async function loadVideo() {
     els.frameInput.min = 1;
     els.frameInput.max = state.meta.frame_count;
     els.frameTotal.textContent = `/ ${state.meta.frame_count}`;
-    els.metaReadout.innerHTML = `
-      <div><b>${state.meta.filename}</b></div>
-      <div>${state.meta.width} × ${state.meta.height} @ ${state.meta.fps.toFixed(2)} fps</div>
-      <div>${state.meta.frame_count} frames</div>
-    `;
+    updateMetaReadout();
     await showFrame(1);
     renderAll();
     setStatus(`Loaded. ${state.balls.size} ball(s) restored.`);
@@ -648,6 +1035,63 @@ function updateMagnifier(ev) {
   els.magnifier.classList.remove("hidden");
 }
 
+async function loadPresets() {
+  try {
+    const res = await fetch("/api/presets");
+    if (!res.ok) throw new Error(res.statusText);
+    const data = await res.json();
+    state.presets = data.presets || [];
+    els.presetSelect.innerHTML = "";
+    for (const p of state.presets) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.name || p.id;
+      els.presetSelect.appendChild(opt);
+    }
+    if (state.presets.length > 0) {
+      state.preset = state.presets[0];
+      els.presetSelect.value = state.preset.id;
+      updateMetaReadout();
+    }
+  } catch (e) {
+    setStatus(`Presets failed: ${e.message}`, true);
+  }
+}
+
+function updateMetaReadout() {
+  const metaLines = [];
+  if (state.meta) {
+    metaLines.push(`<div><b>${state.meta.filename}</b></div>`);
+    metaLines.push(`<div>${state.meta.width} × ${state.meta.height} @ ${state.meta.fps.toFixed(2)} fps</div>`);
+    metaLines.push(`<div>${state.meta.frame_count} frames</div>`);
+  } else {
+    metaLines.push(`<div>No video loaded.</div>`);
+  }
+  if (state.preset) {
+    const cam = state.preset.camera || {};
+    const pos = cam.position || [0, 0, 0];
+    const f = fPx();
+    metaLines.push(`<hr/>`);
+    metaLines.push(`<div><b>Rig:</b> ${state.preset.name || state.preset.id}</div>`);
+    metaLines.push(`<div>focal ${cam.focal_length_mm} mm · sensor ${cam.sensor_width_mm} mm</div>`);
+    metaLines.push(`<div>f<sub>px</sub> ${f != null ? f.toFixed(2) : "—"}</div>`);
+    metaLines.push(`<div>cam pos (${pos.map((x) => x.toFixed(3)).join(", ")}) m</div>`);
+    metaLines.push(`<div>ball r ${state.preset.ball_radius_m} m</div>`);
+  }
+  els.metaReadout.innerHTML = metaLines.join("");
+}
+
+els.presetSelect.addEventListener("change", () => {
+  const p = state.presets.find((x) => x.id === els.presetSelect.value);
+  if (p) {
+    state.preset = p;
+    invalidateTrajectories();
+    updateMetaReadout();
+    renderAll();
+    autoSave();
+  }
+});
+
 els.loadBtn.addEventListener("click", loadVideo);
 els.videoPath.addEventListener("keydown", (e) => { if (e.key === "Enter") loadVideo(); });
 els.saveBtn.addEventListener("click", saveNow);
@@ -708,6 +1152,7 @@ window.addEventListener("mousemove", (ev) => {
     if (ball && ball.keyframes.has(frame)) {
       const kf = ball.keyframes.get(frame);
       kf.pixel_pos = [x - offset[0], y - offset[1]];
+      invalidateTrajectories();
       drawOverlay();
       renderMarkerList();
     }
@@ -742,6 +1187,7 @@ els.overlay.addEventListener("wheel", (ev) => {
       pushHistory();
       const kf = ball.keyframes.get(state.selection.frame);
       kf.radius = Math.max(1, kf.radius + delta);
+      invalidateTrajectories();
       els.radiusInput.value = kf.radius.toFixed(1);
       renderAll();
       autoSave();
@@ -776,3 +1222,4 @@ window.addEventListener("keydown", (e) => {
 });
 
 updateUndoRedoButtons();
+loadPresets();

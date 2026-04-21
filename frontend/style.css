@@ -216,6 +216,25 @@ main {
 }
 .kind-tag.key { color: #ffd166; border-color: #ffd166; }
 .kind-tag.interp { color: var(--muted); }
+.kind-tag.linear { color: #4da3ff; border-color: #4da3ff; }
+.kind-tag.accel  { color: #ff9f43; border-color: #ff9f43; }
+
+.preset-wrap {
+  display: flex; align-items: center; gap: 0.35rem;
+  color: var(--muted); font-size: 12px;
+}
+.preset-wrap select {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px;
+}
+
+.sidebar li.segment { flex-wrap: wrap; gap: 0.35rem; }
+.sidebar li.segment select {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-size: 11px; padding: 1px 3px;
+}
+.segment-mode { margin-left: auto; display: flex; gap: 4px; align-items: center; }
 
 hr { border: 0; border-top: 1px solid var(--border); margin: 0.75rem 0; }
 .muted { color: var(--muted); }
