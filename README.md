@@ -1,102 +1,98 @@
 # PuttFinder Labeller
 
 A local, web-based tool for labelling multiple balls in high-speed, 8-bit
-infrared AVI footage. The backend is Python (FastAPI + OpenCV); the frontend is
-plain HTML/JS/CSS. Labels are stored in a master JSON next to each video.
+infrared AVI footage. Backend is Python (FastAPI + OpenCV); frontend is plain
+HTML/JS/CSS. Labels are stored in a master JSON next to each video.
 
-This repo currently contains **Phase 1 (POC)** — core video I/O, single-click
-placement, scroll-to-resize, and auto-save of a Phase-1 JSON payload.
-
----
-
-## Phase 1 scope
-
-Implemented:
-- OpenCV-backed frame reader with a small LRU cache (`/api/frame/{n}`).
-- `/api/load_video`, `/api/metadata`, `/api/labels`, `/api/save`, `/api/save_as`.
-- Atomic writes of the master JSON (`<video>.labels.json`) beside the video;
-  restored automatically on re-load.
-- UI with playback (Play/Pause, step ±1 frame, scrubber, frame input).
-- Click-to-place markers; scroll-wheel resizes the selected marker (or bumps
-  the default if nothing is selected). Shift+scroll for fine control.
-- Delete key removes the selected marker; sidebar list also has per-row delete.
-- Keyboard shortcuts: `Space` play/pause, `←`/`→` step, `Delete`/`Backspace` remove.
-- Phase-1 JSON payload (`id`, `frame`, `pixel_pos`). `radius` is also captured
-  now so Phase 3 depth inference doesn't require re-labelling. All other
-  physics fields (`world_pos`, `world_vel`, `pixel_vel`, `depth`) are `null`,
-  and the `header.camera` block is `null` — they'll be filled in in Phases 2/3.
-
-Not implemented yet (by design): magnifier, multi-ball UX polish, undo/redo,
-keyframes + interpolation, 3D math, state-aware interpolation.
+Current status: **Phase 2 (MVP)** — multi-ball tracking with persistent IDs,
+linear-interpolation keyframes, editing + undo/redo, and a cursor magnifier.
 
 ---
 
-## Install & run
+## Phases
 
-Requires Python 3.10+.
+- **Phase 1 (POC)** — frame I/O, single-click placement, scroll-to-resize, auto-save.
+- **Phase 2 (MVP) — current** — multi-ball with persistent IDs, keyframes +
+  linear in-air interpolation, drag-to-move, delete, undo/redo, magnifier.
+- **Phase 3 (planned)** — camera intrinsics → world coords, depth inference,
+  constant-acceleration on-surface interpolation, full JSON schema.
+
+---
+
+## Phase 2 features
+
+UI / UX
+- Persistent ball IDs with per-ball color. Sidebar lists all balls; click to
+  make active, `✕` to delete a ball and its keyframes. `+ New` or `N` key
+  creates a new ball. First click on an empty project auto-creates ball #1.
+- Click empty space = place a keyframe for the active ball on the current frame.
+- Click an existing marker = select it (if keyframe) or promote to a keyframe
+  (if interpolated). Drag to move. Scroll wheel resizes the selected marker
+  (Shift-scroll for 0.25 px steps).
+- **Magnifier** — floating zoom window around the cursor (toggle + 4×/6×/8×/12×/16×).
+  Shows all markers in view, with crosshairs centered on the cursor for
+  pixel-perfect clicks.
+- Keyframes render as solid circles with a small square badge and `#N` label.
+  Interpolated markers render dashed with a `#N·i` label.
+
+Editing
+- **Undo / Redo** — `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`), toolbar buttons,
+  200-entry history.
+- **Delete** — `Delete` / `Backspace` removes the selected keyframe; per-row
+  `✕` in the sidebar also deletes keyframes or whole balls.
+- Editing an interpolated frame (dragging, resizing, or clicking-place) upgrades
+  it into a new keyframe and recomputes the adjacent segments.
+
+Interpolation
+- **Linear (in-air)** between each pair of consecutive keyframes for a ball:
+  `pos(f) = k1.pos + t·(k2.pos − k1.pos)` where `t = (f − k1.frame)/(k2.frame − k1.frame)`.
+- `pixel_vel` per frame is the **segment velocity**
+  `(k2.pos − k1.pos) · fps / (k2.frame − k1.frame)` (units: px/s), matching the
+  sample JSON's magnitude. Single-keyframe balls have `pixel_vel: null`.
+
+Save payload
+- Emits one frame entry for every integer frame in the video range that sits
+  within any ball's `[first-keyframe, last-keyframe]` span (matching the
+  densified shape of the sample JSON). Each ball contributes `pixel_pos`,
+  `pixel_vel`, and `radius`. `world_pos`, `world_vel`, `depth`, and
+  `header.camera` remain `null` until Phase 3.
+
+---
+
+## Install & run (uv)
+
+Requires [uv](https://docs.astral.sh/uv/) and Python ≥ 3.10.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# from the project root:
-uvicorn backend.main:app --reload --port 8000
+uv sync
+uv run uvicorn backend.main:app --reload --port 8000
 ```
 
 Open <http://localhost:8000>. Paste the absolute path to an `.avi` in the top
-bar and click **Load Video**. Drop videos in `./videos/` if you want them
-co-located with the repo (the `videos/` folder is gitignored except for
-`.gitkeep`).
+bar, click **Load Video**. Drop videos in `./videos/` to keep them co-located
+with the repo (the folder is gitignored except for `.gitkeep`).
 
 ### Headless servers
 
-If you install on a box without GUI libs, use `opencv-python-headless` in place
-of `opencv-python` (same API, no GUI deps).
+Swap `opencv-python` for `opencv-python-headless` in `pyproject.toml` if the
+target box has no GUI libs (same API, no GUI deps).
 
 ---
 
-## How labels are stored
+## Keyboard & mouse reference
 
-On `Save` (auto-save is debounced and runs after every marker change, plus
-the manual **Save** button), the backend writes
-`<video-stem>.labels.json` next to the source video. **Save As…** prompts for
-a filename and writes a named copy in the same directory.
-
-Phase-1 payload shape (Phase 3 will flesh out `header.camera` and the
-per-ball physics fields):
-
-```json
-{
-  "header": {
-    "fps": 200,
-    "resolution": [624, 540],
-    "frame_start": 1,
-    "frame_end": 1868,
-    "camera": null
-  },
-  "frames": [
-    {
-      "frame": 74,
-      "time": 0.365,
-      "balls": [
-        {
-          "id": 1,
-          "world_pos": null,
-          "world_vel": null,
-          "pixel_pos": [1.80, 114.78],
-          "pixel_vel": null,
-          "depth": null,
-          "radius": 8.0
-        }
-      ]
-    }
-  ]
-}
-```
-
-Atomic save: writes to a `*.tmp` sibling and renames, so a crash mid-write
-won't corrupt the master JSON.
+| Input                        | Effect                                           |
+| ---------------------------- | ------------------------------------------------ |
+| Click on empty space         | Place keyframe for active ball                   |
+| Click on marker              | Select keyframe (or promote interpolated → key)  |
+| Drag marker                  | Move keyframe (upgrading interpolated if needed) |
+| Scroll wheel on frame        | Resize selected keyframe (or default radius)     |
+| Shift + scroll               | Fine adjust (0.25 px per notch)                  |
+| `Space`                      | Play / Pause                                     |
+| `←` / `→`                    | Step ±1 frame                                    |
+| `Delete` / `Backspace`       | Delete selected keyframe                         |
+| `N`                          | New ball                                         |
+| `Ctrl+Z` / `Ctrl+Shift+Z`    | Undo / Redo                                      |
 
 ---
 
@@ -109,7 +105,9 @@ backend/
   labels.py        # atomic JSON read/write
 frontend/
   index.html
-  app.js           # client state, rendering, I/O
+  app.js           # client state, interpolation, rendering, I/O
   style.css
 videos/            # drop your .avi / .json files here (gitignored)
+pyproject.toml     # uv-managed project metadata
+uv.lock
 ```
