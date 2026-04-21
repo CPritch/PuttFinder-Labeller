@@ -56,7 +56,17 @@ const state = {
   preset: null,
   segmentModes: new Map(), // key "ballId:startFrame" -> "linear" | "const_accel"
   trajectoryCache: new Map(), // ballId -> { map: Map<frame, row>, sig: string }
+  radiusAutoSet: true, // becomes false once the user manually edits the input
 };
+
+function seedDefaultRadius() {
+  if (!state.radiusAutoSet) return;
+  const r = inferDefaultRadiusPx();
+  if (r == null || !isFinite(r) || r <= 0) return;
+  const rounded = Math.max(1, Math.round(r * 2) / 2);
+  state.defaultRadius = rounded;
+  els.radiusInput.value = rounded.toFixed(1);
+}
 
 function segKey(ballId, startFrame) { return `${ballId}:${startFrame}`; }
 function invalidateTrajectories() { state.trajectoryCache.clear(); }
@@ -244,6 +254,30 @@ function pointToPlaneDistance(worldPos) {
   if (nlen === 0) return null;
   const d = v3Dot(v3Sub(worldPos, plane.point), n) / nlen;
   return d;
+}
+
+// Pixel radius of a regulation ball sitting on the surface plane at the
+// image-centre ray's intersection with that plane. Used to seed the default
+// radius input once a rig + video are loaded.
+function inferDefaultRadiusPx() {
+  if (!hasCamera() || !state.meta) return null;
+  const plane = surfacePlane();
+  const f = fPx();
+  if (!plane || f == null) return null;
+  const ray = pixelToCamRay(state.meta.width / 2, state.meta.height / 2);
+  const cam = state.preset.camera;
+  const R = cam.matrix_world;
+  const xCam = matCol(R, 0), yCam = matCol(R, 1), zCam = matCol(R, 2);
+  const camPos = matTrans(R);
+  const dirWorld = v3Add(v3Add(v3Mul(xCam, ray[0]), v3Mul(yCam, ray[1])), v3Mul(zCam, ray[2]));
+  const denom = v3Dot(dirWorld, plane.normal);
+  if (Math.abs(denom) < 1e-9) return null;
+  const t = v3Dot(v3Sub(plane.point, camPos), plane.normal) / denom;
+  if (!(t > 0)) return null;
+  const hit = v3Add(camPos, v3Mul(dirWorld, t));
+  const L = v3Norm(v3Sub(hit, camPos));
+  if (!(L > 0)) return null;
+  return GOLF_BALL_RADIUS_M * f / L;
 }
 
 // Infer segment mode from two bounding keyframes. On-surface (both within
@@ -971,6 +1005,7 @@ async function loadVideo() {
     els.frameInput.min = 1;
     els.frameInput.max = state.meta.frame_count;
     els.frameTotal.textContent = `/ ${state.meta.frame_count}`;
+    seedDefaultRadius();
     updateMetaReadout();
     await showFrame(1);
     renderAll();
@@ -1086,6 +1121,7 @@ els.presetSelect.addEventListener("change", () => {
   if (p) {
     state.preset = p;
     invalidateTrajectories();
+    seedDefaultRadius();
     updateMetaReadout();
     renderAll();
     autoSave();
@@ -1108,6 +1144,7 @@ els.frameSlider.addEventListener("input", (e) => { stopPlayback(); showFrame(Num
 els.frameInput.addEventListener("change", (e) => { stopPlayback(); showFrame(Number(e.target.value)); });
 els.radiusInput.addEventListener("change", () => {
   state.defaultRadius = Number(els.radiusInput.value) || state.defaultRadius;
+  state.radiusAutoSet = false;
 });
 els.magToggle.addEventListener("change", () => {
   state.magEnabled = els.magToggle.checked;
@@ -1190,12 +1227,14 @@ els.overlay.addEventListener("wheel", (ev) => {
       invalidateTrajectories();
       els.radiusInput.value = kf.radius.toFixed(1);
       renderAll();
+      updateMagnifier(ev);
       autoSave();
       return;
     }
   }
   state.defaultRadius = Math.max(1, state.defaultRadius + delta);
   els.radiusInput.value = state.defaultRadius.toFixed(1);
+  updateMagnifier(ev);
 }, { passive: false });
 
 window.addEventListener("keydown", (e) => {
