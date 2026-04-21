@@ -95,7 +95,7 @@ function serialize() {
   for (const [id, b] of state.balls) {
     const kfs = [];
     for (const [f, kf] of b.keyframes) {
-      kfs.push([f, { pixel_pos: [...kf.pixel_pos], radius: kf.radius }]);
+      kfs.push([f, { pixel_pos: [...kf.pixel_pos], radius: kf.radius, radius_mode: kf.radius_mode || "auto" }]);
     }
     out.push([id, { id, keyframes: kfs }]);
   }
@@ -112,7 +112,7 @@ function restore(snap) {
   for (const [id, b] of snap.balls) {
     const kfMap = new Map();
     for (const [f, kf] of b.keyframes) {
-      kfMap.set(f, { pixel_pos: [...kf.pixel_pos], radius: kf.radius });
+      kfMap.set(f, { pixel_pos: [...kf.pixel_pos], radius: kf.radius, radius_mode: kf.radius_mode || "auto" });
     }
     state.balls.set(id, { id, keyframes: kfMap });
   }
@@ -246,6 +246,103 @@ function surfacePlane() {
   return { point: s.point, normal: s.normal, threshold: s.proximity_threshold_m ?? 0.05 };
 }
 
+function physicsParams() {
+  if (!state.preset || !state.preset.physics) return { gravity: [0, 0, -9.81], friction: 0.4, radius_tolerance_px: 0.5 };
+  const p = state.preset.physics;
+  return {
+    gravity: p.gravity || [0, 0, -9.81],
+    friction: p.friction ?? 0.4,
+    radius_tolerance_px: p.radius_tolerance_px ?? 0.5,
+  };
+}
+
+function cameraBasis() {
+  if (!hasCamera()) return null;
+  const R = state.preset.camera.matrix_world;
+  return {
+    x: matCol(R, 0),
+    y: matCol(R, 1),
+    z: matCol(R, 2),
+    pos: matTrans(R),
+  };
+}
+
+function pixelRayWorld(px, py) {
+  const b = cameraBasis();
+  const ray = pixelToCamRay(px, py);
+  if (!b || !ray) return null;
+  const dir = v3Add(v3Add(v3Mul(b.x, ray[0]), v3Mul(b.y, ray[1])), v3Mul(b.z, ray[2]));
+  return { origin: b.pos, dir, dirLen: v3Norm(dir) };
+}
+
+// Intersect the camera ray through (px, py) with the surface plane. Returns
+// the world-space hit point (ball centre offset along +normal by ball radius
+// so the ball sits on the plane) plus the Euclidean distance from the camera
+// to that centre.
+function pixelToFloorWorld(px, py) {
+  const plane = surfacePlane();
+  const ray = pixelRayWorld(px, py);
+  if (!plane || !ray) return null;
+  const denom = v3Dot(ray.dir, plane.normal);
+  if (Math.abs(denom) < 1e-9) return null;
+  const t = v3Dot(v3Sub(plane.point, ray.origin), plane.normal) / denom;
+  if (!(t > 0)) return null;
+  const hitOnPlane = v3Add(ray.origin, v3Mul(ray.dir, t));
+  const n = plane.normal;
+  const nLen = v3Norm(n);
+  const nHat = nLen > 0 ? v3Mul(n, 1 / nLen) : [0, 0, 1];
+  const centre = v3Add(hitOnPlane, v3Mul(nHat, GOLF_BALL_RADIUS_M));
+  const L = v3Norm(v3Sub(centre, ray.origin));
+  return { world_pos: centre, L, plane_hit: hitOnPlane, nHat };
+}
+
+// Pixel radius of a ball sitting on the plane at pixel (px, py).
+function floorRadiusAtPixel(px, py) {
+  const f = fPx();
+  const hit = pixelToFloorWorld(px, py);
+  if (f == null || !hit || !(hit.L > 0)) return null;
+  return GOLF_BALL_RADIUS_M * f / hit.L;
+}
+
+// Project a world point to pixel + return Euclidean distance and on-plane
+// pixel radius. Uses the camera basis directly: [X, Y, Z]_cam = R^T · (p - c).
+function worldToPixel(world) {
+  const b = cameraBasis();
+  const f = fPx();
+  if (!b || f == null || !state.meta) return null;
+  const rel = v3Sub(world, b.pos);
+  const xc = v3Dot(rel, b.x);
+  const yc = v3Dot(rel, b.y);
+  const zc = v3Dot(rel, b.z);
+  // Camera looks along -Z: point is in front only if zc < 0.
+  if (zc >= 0) return null;
+  const px = state.meta.width / 2 + (xc / -zc) * f;
+  const py = state.meta.height / 2 - (yc / -zc) * f;
+  const L = Math.hypot(xc, yc, zc);
+  return { px, py, depth: -zc, L, radius_px: GOLF_BALL_RADIUS_M * f / L };
+}
+
+// Per-keyframe on-floor check — `radius_mode: "auto"` (default for new keyframes)
+// always means on-floor; `"explicit"` means the user scrolled radius so treat
+// it as in-air with the stored depth encoded by that radius.
+function keyframeIsOnFloor(kf) {
+  if (!kf) return false;
+  if (kf.radius_mode === "explicit") return false;
+  return true;
+}
+
+// World position of a keyframe: plane intersection when on-floor; radius-derived
+// depth along the camera ray otherwise.
+function keyframeWorldPos(kf) {
+  if (!kf) return null;
+  if (keyframeIsOnFloor(kf)) {
+    const hit = pixelToFloorWorld(kf.pixel_pos[0], kf.pixel_pos[1]);
+    return hit ? hit.world_pos : null;
+  }
+  const w = pixelToWorld(kf.pixel_pos[0], kf.pixel_pos[1], kf.radius);
+  return w ? w.world_pos : null;
+}
+
 function pointToPlaneDistance(worldPos) {
   const plane = surfacePlane();
   if (!plane) return null;
@@ -280,24 +377,21 @@ function inferDefaultRadiusPx() {
   return GOLF_BALL_RADIUS_M * f / L;
 }
 
-// Infer segment mode from two bounding keyframes. On-surface (both within
-// threshold) → const_accel; otherwise linear.
+// Segment mode from two bounding keyframes. Both endpoints on-floor
+// (radius_mode = "auto") → rolling. Otherwise → in_air. User can override
+// per segment via state.segmentModes; "linear" is a manual-only override.
 function inferSegmentMode(k1, k2) {
   if (!hasCamera()) return "linear";
-  const p1 = pixelToWorld(k1.pixel_pos[0], k1.pixel_pos[1], k1.radius);
-  const p2 = pixelToWorld(k2.pixel_pos[0], k2.pixel_pos[1], k2.radius);
-  if (!p1 || !p2) return "linear";
-  const d1 = pointToPlaneDistance(p1.world_pos);
-  const d2 = pointToPlaneDistance(p2.world_pos);
-  const plane = surfacePlane();
-  if (d1 == null || d2 == null || !plane) return "linear";
-  const thr = plane.threshold;
-  return (Math.abs(d1) <= thr && Math.abs(d2) <= thr) ? "const_accel" : "linear";
+  const onFloor1 = keyframeIsOnFloor(k1);
+  const onFloor2 = keyframeIsOnFloor(k2);
+  return (onFloor1 && onFloor2) ? "rolling" : "in_air";
 }
 
 function resolveSegmentMode(ballId, startFrame, k1, k2) {
   const override = state.segmentModes.get(segKey(ballId, startFrame));
-  if (override === "linear" || override === "const_accel") return { mode: override, source: "manual" };
+  if (override === "linear" || override === "rolling" || override === "in_air") {
+    return { mode: override, source: "manual" };
+  }
   return { mode: inferSegmentMode(k1, k2), source: "auto" };
 }
 
@@ -323,126 +417,211 @@ function linearEndVelPxPerFrame(k1, k2) {
   return [(k2.pixel_pos[0] - k1.pixel_pos[0]) / df, (k2.pixel_pos[1] - k1.pixel_pos[1]) / df];
 }
 
-// Compute per-frame trajectory rows for a ball across [kfs[0].frame, kfs[-1].frame].
-// Returns an array of rows:
-//   { frame, pixel_pos:[x,y], pixel_vel:[vx,vy]|null (px/s),
-//     radius, isKeyframe:bool, segIndex:int, mode:"linear"|"const_accel" }
-// Const-accel segments inherit v_start from the previous segment's end velocity
-// (finite difference) and choose acceleration to land on p₂ at t=T:
-//   a = 2·(p₂ − p₁ − v_start·T) / T²   (T in frames)
-// Isolated two-keyframe segments have no prior → fall back to linear.
+// World-space acceleration for a rolling segment: gravity projected onto the
+// plane, plus Coulomb friction opposing the average direction of motion
+// (p2 − p1). Assumes friction direction is constant over the segment — a
+// first-order fit that lets us solve v₀ analytically.
+function rollingAcceleration(p1, p2) {
+  const plane = surfacePlane();
+  const phy = physicsParams();
+  if (!plane) return [0, 0, 0];
+  const n = plane.normal;
+  const nLen = v3Norm(n);
+  const nHat = nLen > 0 ? v3Mul(n, 1 / nLen) : [0, 0, 1];
+  const g = phy.gravity;
+  const gDotN = v3Dot(g, nHat);
+  const gPlane = v3Sub(g, v3Mul(nHat, gDotN));
+  // Direction of motion projected onto plane (subtract any normal component
+  // that might appear from numerical error).
+  let delta = v3Sub(p2, p1);
+  const deltaNormComp = v3Dot(delta, nHat);
+  delta = v3Sub(delta, v3Mul(nHat, deltaNormComp));
+  const dLen = v3Norm(delta);
+  if (dLen < 1e-9) return gPlane;
+  const dir = v3Mul(delta, 1 / dLen);
+  // Normal-direction reaction magnitude = |g · n| (per unit mass). Coulomb
+  // friction magnitude = μ · |g · n|.
+  const frictionMag = phy.friction * Math.abs(gDotN);
+  const aFric = v3Mul(dir, -frictionMag);
+  return v3Add(gPlane, aFric);
+}
+
+// Compute per-frame trajectory rows for a ball across
+// [kfs[0].frame, kfs[-1].frame]. Rolling / in_air segments integrate
+// constant-acceleration physics in *world* space (a determined by rig physics
+// params) and back-project to pixels via the camera. Linear is a pixel-space
+// straight line. Velocities are filled via finite differences once all rows
+// are generated so the first frame of a span isn't null.
 function computeTrajectory(ball) {
   const cached = state.trajectoryCache.get(ball.id);
   const sig = trajectorySignature(ball);
   if (cached && cached.sig === sig) return cached.rows;
   const { kfs, segs } = segmentsOf(ball);
   const rows = [];
+  const fps = state.meta && state.meta.fps > 0 ? state.meta.fps : 200;
+  const dt = 1 / fps;
+
+  const mkRow = (frame, pos, world, isKeyframe, segIndex, mode, onFloor, radius) => ({
+    frame,
+    pixel_pos: [...pos],
+    pixel_vel: null,
+    world_pos: world,
+    world_vel: null,
+    depth: null,
+    radius,
+    isKeyframe,
+    segIndex,
+    mode,
+    onFloor,
+  });
+
   if (kfs.length === 0) {
     state.trajectoryCache.set(ball.id, { sig, rows });
     return rows;
   }
   if (kfs.length === 1) {
     const k = kfs[0];
-    rows.push({
-      frame: k.frame, pixel_pos: [...k.pixel_pos], pixel_vel: null,
-      radius: k.radius, isKeyframe: true, segIndex: -1, mode: "linear",
-    });
+    const world = keyframeWorldPos(k);
+    const onFloor = keyframeIsOnFloor(k);
+    rows.push(mkRow(k.frame, k.pixel_pos, world, true, -1, "linear", onFloor, k.radius));
+    fillDerivatives(rows, fps);
     state.trajectoryCache.set(ball.id, { sig, rows });
     return rows;
   }
 
-  // First pass: resolve each segment's mode and remember per-segment v_start
-  // (px/frame) for const_accel, computed from prior segment's end velocity.
   const segMeta = segs.map(({ k1, k2, index }) => {
     const res = resolveSegmentMode(ball.id, k1.frame, k1, k2);
-    return { k1, k2, index, mode: res.mode, source: res.source, vStart: null, accel: null };
+    return { k1, k2, index, mode: res.mode, source: res.source };
   });
-  for (let i = 0; i < segMeta.length; i++) {
-    const s = segMeta[i];
-    const T = s.k2.frame - s.k1.frame;
-    if (s.mode === "const_accel" && T > 0) {
-      // v_start from previous segment's end velocity (per frame). For the
-      // first segment, there is no prior → fall back to linear.
-      if (i === 0) {
+
+  // Pre-solve world-space trajectory per physics segment. v₀ is solved so
+  // that p₁ + v₀·T + ½·a·T² = p₂ exactly.
+  for (const s of segMeta) {
+    const T_frames = s.k2.frame - s.k1.frame;
+    const T = T_frames * dt;
+    if (s.mode === "rolling" || s.mode === "in_air") {
+      const p1 = keyframeWorldPos(s.k1);
+      const p2 = keyframeWorldPos(s.k2);
+      if (!p1 || !p2 || !(T > 0)) {
         s.mode = "linear";
-        s.source = s.source === "manual" ? "manual_fallback" : "auto_fallback";
-      } else {
-        const prev = segMeta[i - 1];
-        const vPrevEnd = endVelocityPxPerFrame(prev);
-        const dp = [s.k2.pixel_pos[0] - s.k1.pixel_pos[0], s.k2.pixel_pos[1] - s.k1.pixel_pos[1]];
-        const a = [2 * (dp[0] - vPrevEnd[0] * T) / (T * T), 2 * (dp[1] - vPrevEnd[1] * T) / (T * T)];
-        s.vStart = vPrevEnd;
-        s.accel = a;
+        continue;
       }
+      s.p1w = p1;
+      s.p2w = p2;
+      s.a = s.mode === "rolling" ? rollingAcceleration(p1, p2) : physicsParams().gravity;
+      s.v0 = [
+        (p2[0] - p1[0] - 0.5 * s.a[0] * T * T) / T,
+        (p2[1] - p1[1] - 0.5 * s.a[1] * T * T) / T,
+        (p2[2] - p1[2] - 0.5 * s.a[2] * T * T) / T,
+      ];
     }
   }
 
-  function endVelocityPxPerFrame(s) {
-    const T = s.k2.frame - s.k1.frame;
-    if (T <= 0) return [0, 0];
-    if (s.mode === "const_accel" && s.vStart && s.accel) {
-      return [s.vStart[0] + s.accel[0] * T, s.vStart[1] + s.accel[1] * T];
-    }
-    return linearEndVelPxPerFrame(s.k1, s.k2);
-  }
-
-  const fps = state.meta && state.meta.fps > 0 ? state.meta.fps : null;
-  const pushRow = (frame, pos, velPerFrame, radius, isKeyframe, segIndex, mode) => {
-    const vel = velPerFrame && fps
-      ? [velPerFrame[0] * fps, velPerFrame[1] * fps]
-      : null;
-    rows.push({ frame, pixel_pos: [...pos], pixel_vel: vel, radius, isKeyframe, segIndex, mode });
-  };
-
-  // Sample each segment [k1.frame, k2.frame]; include k1 exactly once across
-  // segments by emitting it only on the first segment and letting each
-  // subsequent segment start at k1.frame + 1.
   for (let i = 0; i < segMeta.length; i++) {
     const s = segMeta[i];
     const { k1, k2 } = s;
-    const T = k2.frame - k1.frame;
+    const T_frames = k2.frame - k1.frame;
     const startF = i === 0 ? k1.frame : k1.frame + 1;
     for (let f = startF; f <= k2.frame; f++) {
-      const tau = f - k1.frame;
-      let pos, velPF, radius, isKf, mode;
-      if (f === k1.frame) {
-        pos = [...k1.pixel_pos];
-        radius = k1.radius;
-        isKf = true;
-        mode = s.mode;
-        velPF = i > 0 ? endVelocityPxPerFrame(segMeta[i - 1]) : (s.mode === "linear" ? linearEndVelPxPerFrame(k1, k2) : (s.vStart || [0, 0]));
-      } else if (f === k2.frame) {
-        pos = [...k2.pixel_pos];
-        radius = k2.radius;
-        isKf = true;
-        mode = s.mode;
-        velPF = endVelocityPxPerFrame(s);
-      } else {
-        const u = tau / T;
-        if (s.mode === "const_accel") {
-          const p = [
-            k1.pixel_pos[0] + s.vStart[0] * tau + 0.5 * s.accel[0] * tau * tau,
-            k1.pixel_pos[1] + s.vStart[1] * tau + 0.5 * s.accel[1] * tau * tau,
-          ];
-          pos = p;
-          velPF = [s.vStart[0] + s.accel[0] * tau, s.vStart[1] + s.accel[1] * tau];
+      const tau_frames = f - k1.frame;
+      const tau = tau_frames * dt;
+      const isKf = (f === k1.frame) || (f === k2.frame);
+      let pos, world = null, radius;
+      const onFloor = (s.mode === "rolling");
+
+      if (s.mode === "rolling" || s.mode === "in_air") {
+        world = [
+          s.p1w[0] + s.v0[0] * tau + 0.5 * s.a[0] * tau * tau,
+          s.p1w[1] + s.v0[1] * tau + 0.5 * s.a[1] * tau * tau,
+          s.p1w[2] + s.v0[2] * tau + 0.5 * s.a[2] * tau * tau,
+        ];
+        const pxR = worldToPixel(world);
+        if (pxR) {
+          pos = [pxR.px, pxR.py];
+          radius = pxR.radius_px;
         } else {
+          // Fall back to pixel-linear if projection failed.
+          const u = T_frames > 0 ? tau_frames / T_frames : 0;
           pos = [
             k1.pixel_pos[0] + u * (k2.pixel_pos[0] - k1.pixel_pos[0]),
             k1.pixel_pos[1] + u * (k2.pixel_pos[1] - k1.pixel_pos[1]),
           ];
-          velPF = linearEndVelPxPerFrame(k1, k2);
+          radius = k1.radius + u * (k2.radius - k1.radius);
         }
-        radius = k1.radius + u * (k2.radius - k1.radius);
-        isKf = false;
-        mode = s.mode;
+      } else {
+        // Linear mode: pixel-space straight line; radius tracks the floor
+        // if both endpoints are auto, otherwise linearly interpolated.
+        const u = T_frames > 0 ? tau_frames / T_frames : 0;
+        pos = [
+          k1.pixel_pos[0] + u * (k2.pixel_pos[0] - k1.pixel_pos[0]),
+          k1.pixel_pos[1] + u * (k2.pixel_pos[1] - k1.pixel_pos[1]),
+        ];
+        if (keyframeIsOnFloor(k1) && keyframeIsOnFloor(k2)) {
+          const fr = floorRadiusAtPixel(pos[0], pos[1]);
+          radius = fr != null ? fr : (k1.radius + u * (k2.radius - k1.radius));
+          const hit = pixelToFloorWorld(pos[0], pos[1]);
+          if (hit) world = hit.world_pos;
+        } else {
+          radius = k1.radius + u * (k2.radius - k1.radius);
+          const w = pixelToWorld(pos[0], pos[1], radius);
+          if (w) world = w.world_pos;
+        }
       }
-      pushRow(f, pos, velPF, radius, isKf, s.index, mode);
+
+      // For a physics keyframe we pin back to the user's pixel to avoid any
+      // projection drift on the boundary.
+      if (isKf) {
+        pos = [...(f === k1.frame ? k1.pixel_pos : k2.pixel_pos)];
+        const srcKf = f === k1.frame ? k1 : k2;
+        // Keyframe radius: for on-floor keyframes, always the per-pixel
+        // floor radius; for explicit keyframes, the stored value.
+        if (keyframeIsOnFloor(srcKf)) {
+          const fr = floorRadiusAtPixel(pos[0], pos[1]);
+          radius = fr != null ? fr : srcKf.radius;
+        } else {
+          radius = srcKf.radius;
+        }
+        world = keyframeWorldPos(srcKf);
+      }
+
+      rows.push(mkRow(f, pos, world, isKf, s.index, s.mode, onFloor, radius));
     }
   }
 
+  fillDerivatives(rows, fps);
   state.trajectoryCache.set(ball.id, { sig, rows });
   return rows;
+}
+
+function fillDerivatives(rows, fps) {
+  const b = cameraBasis();
+  const forward = b ? v3Mul(b.z, -1) : null;
+  for (let i = 0; i < rows.length; i++) {
+    const curr = rows[i];
+    const prev = i > 0 ? rows[i - 1] : null;
+    const next = i + 1 < rows.length ? rows[i + 1] : null;
+    if (prev) {
+      curr.pixel_vel = [(curr.pixel_pos[0] - prev.pixel_pos[0]) * fps, (curr.pixel_pos[1] - prev.pixel_pos[1]) * fps];
+    } else if (next) {
+      curr.pixel_vel = [(next.pixel_pos[0] - curr.pixel_pos[0]) * fps, (next.pixel_pos[1] - curr.pixel_pos[1]) * fps];
+    }
+    if (curr.world_pos) {
+      if (prev && prev.world_pos) {
+        curr.world_vel = [
+          (curr.world_pos[0] - prev.world_pos[0]) * fps,
+          (curr.world_pos[1] - prev.world_pos[1]) * fps,
+          (curr.world_pos[2] - prev.world_pos[2]) * fps,
+        ];
+      } else if (next && next.world_pos) {
+        curr.world_vel = [
+          (next.world_pos[0] - curr.world_pos[0]) * fps,
+          (next.world_pos[1] - curr.world_pos[1]) * fps,
+          (next.world_pos[2] - curr.world_pos[2]) * fps,
+        ];
+      }
+      if (b && forward) curr.depth = v3Dot(v3Sub(curr.world_pos, b.pos), forward);
+    }
+  }
 }
 
 function trajectorySignature(ball) {
@@ -477,6 +656,7 @@ function markerAt(ball, frame) {
     pixel_vel: r.pixel_vel,
     radius: r.radius,
     mode: r.mode,
+    onFloor: r.onFloor === true,
   };
 }
 
@@ -488,9 +668,36 @@ function addOrUpdateKeyframe(ballId, frame, pos, radius) {
     state.balls.set(ballId, ball);
   }
   const existing = ball.keyframes.get(frame);
+  // Default behaviour: new / auto keyframes sit on the floor at their pixel.
+  // Explicit radius passed in → explicit (in-air). An existing explicit
+  // keyframe keeps its state unless radius is overridden again.
+  const px = pos[0], py = pos[1];
+  let radius_mode, finalRadius;
+  if (radius != null) {
+    radius_mode = "explicit";
+    finalRadius = radius;
+  } else if (existing) {
+    radius_mode = existing.radius_mode || "auto";
+    if (radius_mode === "auto") {
+      const floor = floorRadiusAtPixel(px, py);
+      finalRadius = floor != null ? floor : existing.radius;
+    } else {
+      finalRadius = existing.radius;
+    }
+  } else {
+    const floor = floorRadiusAtPixel(px, py);
+    if (floor != null) {
+      radius_mode = "auto";
+      finalRadius = floor;
+    } else {
+      radius_mode = "auto";
+      finalRadius = state.defaultRadius;
+    }
+  }
   ball.keyframes.set(frame, {
     pixel_pos: [...pos],
-    radius: radius != null ? radius : (existing ? existing.radius : state.defaultRadius),
+    radius: finalRadius,
+    radius_mode,
   });
   state.selection = { ballId, frame };
   state.activeBallId = ballId;
@@ -535,11 +742,20 @@ function drawOverlay() {
     const isSel = state.selection && state.selection.ballId === ball.id
       && state.selection.frame === state.currentFrame && m.kind === "keyframe";
 
+    // On-floor markers (rolling keyframes + interpolated rolling samples)
+    // always draw at the geometry-derived floor radius so the user sees the
+    // radius the physics is using, even if a stale stored value lags.
+    let drawRadius = m.radius;
+    if (m.onFloor) {
+      const fr = floorRadiusAtPixel(x, y);
+      if (fr != null) drawRadius = fr;
+    }
+
     ctx.lineWidth = isSel ? 2 : 1.25;
     ctx.strokeStyle = color;
     if (m.kind === "interp") ctx.setLineDash([4, 3]); else ctx.setLineDash([]);
     ctx.beginPath();
-    ctx.arc(x, y, m.radius, 0, Math.PI * 2);
+    ctx.arc(x, y, drawRadius, 0, Math.PI * 2);
     ctx.stroke();
     ctx.setLineDash([]);
 
@@ -551,13 +767,13 @@ function drawOverlay() {
     if (m.kind === "keyframe") {
       ctx.fillStyle = color;
       ctx.beginPath();
-      ctx.rect(x + m.radius + 3, y - 3, 4, 4);
+      ctx.rect(x + drawRadius + 3, y - 3, 4, 4);
       ctx.fill();
     }
 
     ctx.fillStyle = color;
     ctx.font = "bold 11px ui-monospace, monospace";
-    ctx.fillText(`#${ball.id}${m.kind === "interp" ? "·i" : ""}`, x + m.radius + 9, y + 3);
+    ctx.fillText(`#${ball.id}${m.kind === "interp" ? "·i" : ""}`, x + drawRadius + 9, y + 3);
   }
 }
 
@@ -618,7 +834,7 @@ function renderMarkerList() {
     const isSel = state.selection && state.selection.ballId === ball.id
       && state.selection.frame === state.currentFrame && m.kind === "keyframe";
     if (isSel) li.classList.add("selected");
-    const modeCls = m.mode === "const_accel" ? "accel" : "linear";
+    const modeCls = m.mode === "rolling" ? "accel" : m.mode === "in_air" ? "linear" : "interp";
     const modeTag = m.mode ? `<span class="kind-tag ${modeCls}">${m.mode}</span>` : "";
     const tag = m.kind === "keyframe"
       ? `<span class="kind-tag key">KEY</span>${modeTag}`
@@ -684,7 +900,7 @@ function renderSegmentList() {
     const effective = override === "auto" ? inferred : override;
     const li = document.createElement("li");
     li.className = "segment";
-    const tagCls = effective === "const_accel" ? "accel" : "linear";
+    const tagCls = effective === "rolling" ? "accel" : effective === "in_air" ? "linear" : "interp";
     li.innerHTML = `
       <span>seg ${index + 1}</span>
       <span class="muted">${k1.frame}→${k2.frame}</span>
@@ -692,8 +908,9 @@ function renderSegmentList() {
       <span class="segment-mode">
         <select title="Override mode">
           <option value="auto">auto (${inferred})</option>
+          <option value="rolling">rolling</option>
+          <option value="in_air">in_air</option>
           <option value="linear">linear</option>
-          <option value="const_accel">const_accel</option>
         </select>
       </span>
     `;
@@ -786,72 +1003,36 @@ function findMarkerAtPoint(x, y) {
   return hits[0] || null;
 }
 
-function roundVec(v, n = 6) {
-  return v == null ? null : v.map((x) => Number(x.toFixed(n)));
-}
-
-function worldVelAt(ball, f, rows, idx) {
-  if (idx <= 0) return null;
-  const fps = state.meta && state.meta.fps > 0 ? state.meta.fps : null;
-  if (!fps) return null;
-  const prev = rows[idx - 1];
-  const curr = rows[idx];
-  if (!prev.world_pos || !curr.world_pos) return null;
-  const dt = 1 / fps;
-  return [
-    (curr.world_pos[0] - prev.world_pos[0]) / dt,
-    (curr.world_pos[1] - prev.world_pos[1]) / dt,
-    (curr.world_pos[2] - prev.world_pos[2]) / dt,
-  ];
-}
-
 function buildPayload() {
   const balls = [...state.balls.values()];
   const frameMin = state.meta ? state.meta.frame_start : 1;
   const frameMax = state.meta ? state.meta.frame_end : 1;
 
-  // Precompute per-ball dense rows + world projections (depth/world_pos) to
-  // allow backward-difference world_vel.
   const perBall = new Map();
   for (const ball of balls) {
     const rows = computeTrajectory(ball);
-    const enriched = rows.map((r) => {
-      const w = pixelToWorld(r.pixel_pos[0], r.pixel_pos[1], r.radius);
-      return {
-        frame: r.frame,
-        pixel_pos: r.pixel_pos,
-        pixel_vel: r.pixel_vel,
-        radius: r.radius,
-        isKeyframe: r.isKeyframe,
-        world_pos: w ? w.world_pos : null,
-        depth: w ? w.depth : null,
-      };
-    });
     const byFrame = new Map();
-    enriched.forEach((row, idx) => {
-      byFrame.set(row.frame, { row, idx });
-    });
-    perBall.set(ball.id, { rows: enriched, byFrame });
+    rows.forEach((row) => byFrame.set(row.frame, row));
+    perBall.set(ball.id, byFrame);
   }
 
   const frames = [];
   for (let f = frameMin; f <= frameMax; f++) {
     const list = [];
     for (const ball of balls) {
-      const bundle = perBall.get(ball.id);
-      const found = bundle && bundle.byFrame.get(f);
-      if (!found) continue;
-      const { row, idx } = found;
-      const worldVel = worldVelAt(ball, f, bundle.rows, idx);
+      const row = perBall.get(ball.id).get(f);
+      if (!row) continue;
       list.push({
         id: ball.id,
-        world_pos: roundVec(row.world_pos),
-        world_vel: roundVec(worldVel),
-        pixel_pos: roundVec(row.pixel_pos, 3),
-        pixel_vel: roundVec(row.pixel_vel, 3),
-        depth: row.depth != null ? Number(row.depth.toFixed(6)) : null,
-        radius: Number(row.radius.toFixed(3)),
+        world_pos: row.world_pos,
+        world_vel: row.world_vel,
+        pixel_pos: row.pixel_pos,
+        pixel_vel: row.pixel_vel,
+        depth: row.depth,
+        radius: row.radius,
         keyframe: row.isKeyframe === true ? true : false,
+        on_floor: row.onFloor === true,
+        mode: row.mode,
       });
     }
     if (list.length === 0) continue;
@@ -864,6 +1045,7 @@ function buildPayload() {
 
   const camera = state.preset && state.preset.camera ? state.preset.camera : null;
   const surface = state.preset && state.preset.surface ? state.preset.surface : null;
+  const physics = state.preset && state.preset.physics ? state.preset.physics : null;
   const header = {
     fps: state.meta ? state.meta.fps : null,
     resolution: state.meta ? state.meta.resolution : null,
@@ -873,12 +1055,34 @@ function buildPayload() {
     preset_id: state.preset ? state.preset.id : null,
     camera,
     surface,
+    physics,
     segment_modes: [...state.segmentModes.entries()].map(([k, v]) => {
       const [ballId, startFrame] = k.split(":");
       return { ball_id: Number(ballId), start_frame: Number(startFrame), mode: v };
     }),
+    keyframes: buildKeyframesHeader(),
   };
   return { header, frames };
+}
+
+// Persist the full keyframe set (pixels + radius_mode) so reloads are lossless
+// without relying on the denser per-frame list.
+function buildKeyframesHeader() {
+  const out = [];
+  for (const ball of state.balls.values()) {
+    const rows = [];
+    for (const [frame, kf] of ball.keyframes) {
+      rows.push({
+        frame,
+        pixel_pos: [...kf.pixel_pos],
+        radius: kf.radius,
+        radius_mode: kf.radius_mode || "auto",
+      });
+    }
+    rows.sort((a, b) => a.frame - b.frame);
+    out.push({ ball_id: ball.id, keyframes: rows });
+  }
+  return out;
 }
 
 function ingestLoadedLabels(data) {
@@ -890,56 +1094,79 @@ function ingestLoadedLabels(data) {
   state.history.undo.length = 0;
   state.history.redo.length = 0;
   invalidateTrajectories();
-  if (!data || !data.frames) return;
+  if (!data) return;
+  const header = data.header || {};
 
-  // Collect all frame/ball rows in order.
-  const rowsByBall = new Map();
-  for (const fr of data.frames) {
-    for (const b of fr.balls || []) {
-      const id = b.id;
-      if (!state.balls.has(id)) state.balls.set(id, { id, keyframes: new Map() });
+  // Preferred path: explicit keyframe header (Phase 3 v1.0+). Carries the
+  // full radius_mode per keyframe so rolling/in-air is preserved losslessly.
+  if (Array.isArray(header.keyframes) && header.keyframes.length > 0) {
+    for (const entry of header.keyframes) {
+      if (!entry || entry.ball_id == null) continue;
+      const id = entry.ball_id;
+      const ball = { id, keyframes: new Map() };
+      for (const kf of entry.keyframes || []) {
+        if (kf == null || kf.frame == null || !Array.isArray(kf.pixel_pos)) continue;
+        ball.keyframes.set(kf.frame, {
+          pixel_pos: [...kf.pixel_pos],
+          radius: kf.radius ?? state.defaultRadius,
+          radius_mode: kf.radius_mode === "explicit" ? "explicit" : "auto",
+        });
+      }
+      if (ball.keyframes.size === 0) continue;
+      state.balls.set(id, ball);
       if (id >= state.nextBallId) state.nextBallId = id + 1;
-      if (!rowsByBall.has(id)) rowsByBall.set(id, []);
-      rowsByBall.get(id).push({
-        frame: fr.frame,
-        pixel_pos: b.pixel_pos,
-        radius: b.radius ?? state.defaultRadius,
-        keyframe: b.keyframe === true,
-      });
     }
-  }
-
-  for (const [id, rows] of rowsByBall) {
-    rows.sort((a, b) => a.frame - b.frame);
-    const ball = state.balls.get(id);
-    const explicit = rows.filter((r) => r.keyframe === true);
-    let chosen;
-    if (explicit.length >= 1) {
-      // Honor explicit keyframe flags. Always include the first and last
-      // appearance as keyframes too, so span reconstruction is lossless.
-      const firstRow = rows[0];
-      const lastRow = rows[rows.length - 1];
-      const set = new Map();
-      for (const r of explicit) set.set(r.frame, r);
-      set.set(firstRow.frame, firstRow);
-      set.set(lastRow.frame, lastRow);
-      chosen = [...set.values()].sort((a, b) => a.frame - b.frame);
-    } else {
-      // Legacy payload (no keyframe flags): fall back to endpoints only.
-      if (rows.length === 0) continue;
-      chosen = rows.length === 1 ? [rows[0]] : [rows[0], rows[rows.length - 1]];
+  } else if (data.frames) {
+    // Legacy path: reconstruct keyframes from the dense per-frame list.
+    const rowsByBall = new Map();
+    for (const fr of data.frames) {
+      for (const b of fr.balls || []) {
+        const id = b.id;
+        if (!state.balls.has(id)) state.balls.set(id, { id, keyframes: new Map() });
+        if (id >= state.nextBallId) state.nextBallId = id + 1;
+        if (!rowsByBall.has(id)) rowsByBall.set(id, []);
+        rowsByBall.get(id).push({
+          frame: fr.frame,
+          pixel_pos: b.pixel_pos,
+          radius: b.radius ?? state.defaultRadius,
+          keyframe: b.keyframe === true,
+          on_floor: b.on_floor === true,
+        });
+      }
     }
-    for (const r of chosen) {
-      ball.keyframes.set(r.frame, { pixel_pos: [...r.pixel_pos], radius: r.radius });
+    for (const [id, rows] of rowsByBall) {
+      rows.sort((a, b) => a.frame - b.frame);
+      const ball = state.balls.get(id);
+      const explicit = rows.filter((r) => r.keyframe === true);
+      let chosen;
+      if (explicit.length >= 1) {
+        const firstRow = rows[0];
+        const lastRow = rows[rows.length - 1];
+        const set = new Map();
+        for (const r of explicit) set.set(r.frame, r);
+        set.set(firstRow.frame, firstRow);
+        set.set(lastRow.frame, lastRow);
+        chosen = [...set.values()].sort((a, b) => a.frame - b.frame);
+      } else {
+        if (rows.length === 0) continue;
+        chosen = rows.length === 1 ? [rows[0]] : [rows[0], rows[rows.length - 1]];
+      }
+      for (const r of chosen) {
+        ball.keyframes.set(r.frame, {
+          pixel_pos: [...r.pixel_pos],
+          radius: r.radius,
+          radius_mode: r.on_floor ? "auto" : "explicit",
+        });
+      }
     }
   }
 
   // Restore segment-mode overrides from header, if present.
-  const header = data.header || {};
+  const VALID_MODES = new Set(["linear", "rolling", "in_air"]);
   for (const entry of header.segment_modes || []) {
     if (!entry) continue;
     const { ball_id, start_frame, mode } = entry;
-    if ((mode === "linear" || mode === "const_accel") && ball_id != null && start_frame != null) {
+    if (VALID_MODES.has(mode) && ball_id != null && start_frame != null) {
       state.segmentModes.set(segKey(ball_id, start_frame), mode);
     }
   }
@@ -1165,8 +1392,12 @@ els.overlay.addEventListener("mousedown", (ev) => {
       state.selection = { ballId: hit.ball.id, frame: state.currentFrame };
       state.dragging = { ballId: hit.ball.id, frame: state.currentFrame, offset: [x - hit.m.pixel_pos[0], y - hit.m.pixel_pos[1]], startedHistory: false };
     } else {
+      // Promoting an interpolated position to a keyframe: inherit the
+      // interpolated radius mode — if the containing segment is rolling
+      // (on-floor endpoints), the new keyframe is auto; otherwise explicit.
       pushHistory();
-      addOrUpdateKeyframe(hit.ball.id, state.currentFrame, hit.m.pixel_pos, hit.m.radius);
+      const promotedRadius = hit.m.onFloor ? null : hit.m.radius;
+      addOrUpdateKeyframe(hit.ball.id, state.currentFrame, hit.m.pixel_pos, promotedRadius);
       state.dragging = { ballId: hit.ball.id, frame: state.currentFrame, offset: [x - hit.m.pixel_pos[0], y - hit.m.pixel_pos[1]], startedHistory: true };
       renderAll();
       autoSave();
@@ -1174,7 +1405,8 @@ els.overlay.addEventListener("mousedown", (ev) => {
   } else {
     const ballId = ensureActiveBall();
     pushHistory();
-    addOrUpdateKeyframe(ballId, state.currentFrame, [x, y], state.defaultRadius);
+    // Click on empty space → on-floor keyframe (radius = null signals auto).
+    addOrUpdateKeyframe(ballId, state.currentFrame, [x, y], null);
     state.dragging = { ballId, frame: state.currentFrame, offset: [0, 0], startedHistory: true };
     renderAll();
     autoSave();
@@ -1189,6 +1421,10 @@ window.addEventListener("mousemove", (ev) => {
     if (ball && ball.keyframes.has(frame)) {
       const kf = ball.keyframes.get(frame);
       kf.pixel_pos = [x - offset[0], y - offset[1]];
+      if (kf.radius_mode !== "explicit") {
+        const floor = floorRadiusAtPixel(kf.pixel_pos[0], kf.pixel_pos[1]);
+        if (floor != null) kf.radius = floor;
+      }
       invalidateTrajectories();
       drawOverlay();
       renderMarkerList();
@@ -1223,6 +1459,14 @@ els.overlay.addEventListener("wheel", (ev) => {
     if (ball && ball.keyframes.has(state.selection.frame)) {
       pushHistory();
       const kf = ball.keyframes.get(state.selection.frame);
+      // Scrolling radius on a keyframe always encodes depth explicitly, so
+      // flip it off the floor. Starting from the current floor radius keeps
+      // the first tick feel natural even if the stored value was stale.
+      if (kf.radius_mode !== "explicit") {
+        const floor = floorRadiusAtPixel(kf.pixel_pos[0], kf.pixel_pos[1]);
+        if (floor != null) kf.radius = floor;
+        kf.radius_mode = "explicit";
+      }
       kf.radius = Math.max(1, kf.radius + delta);
       invalidateTrajectories();
       els.radiusInput.value = kf.radius.toFixed(1);

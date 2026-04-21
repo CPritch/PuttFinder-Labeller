@@ -102,6 +102,11 @@ def _test_rig() -> dict[str, Any]:
             "normal": normal.tolist(),
             "proximity_threshold_m": 2.0 * GOLF_BALL_RADIUS_M,
         },
+        "physics": {
+            "gravity": [0.0, 0.0, -9.81],
+            "friction": 0.4,
+            "radius_tolerance_px": 0.5,
+        },
     }
 
 
