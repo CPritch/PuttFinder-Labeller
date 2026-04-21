@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+.DS_Store
+*.log
+
+# Data
+videos/*.avi
+videos/*.mp4
+videos/*.mov
+videos/*.mkv
+videos/*.json
+!videos/.gitkeep
