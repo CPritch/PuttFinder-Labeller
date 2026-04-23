@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .labels import load_labels, save_labels
+from .presets import list_presets
 from .video_store import video_store
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +50,11 @@ def api_load_video(body: LoadVideoRequest):
     labels_path = video_store.labels_path
     existing = load_labels(labels_path) if labels_path else None
     return {"metadata": meta, "labels": existing}
+
+
+@app.get("/api/presets")
+def api_presets():
+    return {"presets": list_presets()}
 
 
 @app.get("/api/metadata")

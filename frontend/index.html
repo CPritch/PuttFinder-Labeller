@@ -7,12 +7,18 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">PuttFinder Labeller <span class="phase">POC</span></div>
+    <div class="brand">PuttFinder Labeller <span class="phase">v1.0</span></div>
     <div class="load-row">
       <input id="videoPath" type="text" placeholder="Absolute path to .avi (e.g. /home/user/PuttFinder-Labeller/videos/clip.avi)" />
       <button id="loadBtn">Load Video</button>
+      <label class="preset-wrap">
+        Rig
+        <select id="presetSelect"></select>
+      </label>
     </div>
     <div class="save-row">
+      <button id="undoBtn" title="Undo (Ctrl+Z)">Undo</button>
+      <button id="redoBtn" title="Redo (Ctrl+Shift+Z)">Redo</button>
       <button id="saveBtn" title="Overwrite master JSON">Save</button>
       <button id="saveAsBtn" title="Save a named copy next to video">Save As&hellip;</button>
       <span id="saveStatus" class="muted"></span>
@@ -24,6 +30,10 @@
       <div id="viewport" class="viewport">
         <img id="frameImg" draggable="false" />
         <canvas id="overlay"></canvas>
+        <div id="magnifier" class="magnifier hidden">
+          <canvas id="magCanvas" width="180" height="180"></canvas>
+          <div class="mag-label"><span id="magCoord">0, 0</span> · <span id="magZoom">8×</span></div>
+        </div>
       </div>
 
       <div class="controls">
@@ -40,23 +50,46 @@
 
       <div class="radius-row">
         <label>
-          Radius (scroll on frame to adjust):
-          <input id="radiusInput" type="number" min="1" step="0.5" value="8" />
-          px
+          Default radius:
+          <input id="radiusInput" type="number" min="1" step="0.5" value="8" /> px
         </label>
-        <span class="muted">Click to place a marker. Selected marker is adjusted by the scroll-wheel.</span>
+        <label>
+          <input id="magToggle" type="checkbox" checked /> Magnifier
+        </label>
+        <label>
+          Zoom
+          <select id="magZoomSel">
+            <option value="4">4×</option>
+            <option value="6">6×</option>
+            <option value="8" selected>8×</option>
+            <option value="12">12×</option>
+            <option value="16">16×</option>
+          </select>
+        </label>
+        <span class="muted small">Click = place / select · drag = move · scroll = radius · Shift-scroll = fine</span>
       </div>
     </section>
 
     <aside class="sidebar">
-      <h2>Current Frame Markers</h2>
-      <ul id="markerList"></ul>
-      <div class="muted small">
-        Click sets a ball center. Scroll the wheel over the frame to resize the
-        most recently placed or selected marker.
+      <div class="sidebar-head">
+        <h2>Balls</h2>
+        <button id="newBallBtn" title="New ball (N)">+ New</button>
       </div>
+      <ul id="ballList"></ul>
+
       <hr />
-      <h2>Video</h2>
+
+      <h2>Current Frame</h2>
+      <ul id="markerList"></ul>
+
+      <hr />
+
+      <h2>Segments (active ball)</h2>
+      <ul id="segmentList"></ul>
+
+      <hr />
+
+      <h2>Video / Rig</h2>
       <div id="metaReadout" class="muted small">No video loaded.</div>
     </aside>
   </main>
